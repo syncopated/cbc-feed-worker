@@ -179,11 +179,25 @@ function episodeTitle(pubDateISO: string): string {
   return `The World This Hour: ${time} ${dateFmt.format(date)}`;
 }
 
+// Effective publish date: the later of fetchedAt (when we first saw it)
+// and the original CBC pubDate. Usually fetchedAt is later, but if CBC
+// ever publishes with a pubDate more recent than our fetch timestamp,
+// that newer moment wins so the episode sorts as most-recent.
+function effectivePubDate(entry: Entry): Date {
+  const fetched = new Date(entry.fetchedAt).getTime();
+  const cbc = new Date(entry.pubDateISO).getTime();
+  const pick = Math.max(
+    isNaN(fetched) ? 0 : fetched,
+    isNaN(cbc) ? 0 : cbc,
+  );
+  return new Date(pick);
+}
+
 function generateFeedXml(entries: Entry[]): string {
   const recent = entries
     .slice()
     .sort((a, b) =>
-      new Date(b.pubDateISO).getTime() - new Date(a.pubDateISO).getTime()
+      effectivePubDate(b).getTime() - effectivePubDate(a).getTime()
     )
     .slice(0, MAX_EPISODES);
 
@@ -194,7 +208,7 @@ function generateFeedXml(entries: Entry[]): string {
             <title>${esc(episodeTitle(entry.pubDateISO))}</title>
             <description>Catch up on the day's most important news from Canada and around the world in 5 minutes. Updated every hour, 24/7.</description>
             <itunes:summary>Catch up on the day's most important news from Canada and around the world in 5 minutes. Updated every hour, 24/7.</itunes:summary>
-            <pubDate>${esc(new Date(entry.fetchedAt).toUTCString())}</pubDate>
+            <pubDate>${esc(effectivePubDate(entry).toUTCString())}</pubDate>
             <itunes:duration>${esc(entry.duration)}</itunes:duration>
             <itunes:explicit>No</itunes:explicit>
             <enclosure url="${esc(entry.audioUrl)}" length="${entry.audioLength}" type="${esc(entry.audioType)}" />
