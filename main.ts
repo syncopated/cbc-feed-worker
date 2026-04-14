@@ -43,15 +43,6 @@ async function saveEntries(entries: Entry[]): Promise<void> {
   await kv.set(["entries"], entries);
 }
 
-async function saveFeedXml(xml: string): Promise<void> {
-  await kv.set(["feed-xml"], xml);
-}
-
-async function getFeedXml(): Promise<string | null> {
-  const result = await kv.get<string>(["feed-xml"]);
-  return result.value;
-}
-
 // ---------------------------------------------------------------------------
 // XML parsing — extract episodes from CBC's feed
 // ---------------------------------------------------------------------------
@@ -236,9 +227,6 @@ async function fetchFeed(): Promise<void> {
 
     await saveEntries(entries);
 
-    const feedXml = generateFeedXml(entries);
-    await saveFeedXml(feedXml);
-
     for (const ep of newEpisodes) {
       console.log(`New: ${ep.guid} (${ep.pubDate})`);
     }
@@ -249,15 +237,6 @@ async function fetchFeed(): Promise<void> {
 }
 
 Deno.cron("fetch-cbc-feed", "*/5 * * * *", fetchFeed);
-
-// Regenerate the feed XML on startup from whatever history is in KV,
-// so the served feed reflects all accumulated episodes even if no new
-// episode is fetched this cycle.
-const existingEntries = await getEntries();
-if (existingEntries.length > 0) {
-  await saveFeedXml(generateFeedXml(existingEntries));
-  console.log(`Startup: regenerated feed XML from ${existingEntries.length} stored entries`);
-}
 
 // Run once on startup so the feed is populated immediately
 await fetchFeed();
@@ -270,10 +249,11 @@ Deno.serve({ port: 8000 }, async (req: Request) => {
   const url = new URL(req.url);
 
   if (url.pathname === "/feed.xml" || url.pathname === "/feed") {
-    const xml = await getFeedXml();
-    if (!xml) {
+    const entries = await getEntries();
+    if (entries.length === 0) {
       return new Response("Feed not yet available", { status: 503 });
     }
+    const xml = generateFeedXml(entries);
     return new Response(xml, {
       headers: {
         "content-type": "application/rss+xml; charset=utf-8",
