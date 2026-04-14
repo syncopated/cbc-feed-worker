@@ -39,8 +39,49 @@ async function getEntries(): Promise<Entry[]> {
   return result.value ?? [];
 }
 
-async function saveEntries(entries: Entry[]): Promise<void> {
-  await kv.set(["entries"], entries);
+// Atomically merge new episodes into the stored entries list.
+// Uses a versionstamp check to detect concurrent writes from other
+// isolates and retries on conflict. Returns the final entries list
+// on success, or null if all retries were exhausted.
+async function mergeEntriesAtomic(
+  candidates: Entry[],
+  maxStored = 48,
+  maxAttempts = 5,
+): Promise<{ entries: Entry[]; added: Entry[] } | null> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const current = await kv.get<Entry[]>(["entries"]);
+    const existing = current.value ?? [];
+    const seen = new Set(existing.map((e) => e.guid));
+
+    const added: Entry[] = [];
+    for (const ep of candidates) {
+      if (seen.has(ep.guid)) continue;
+      seen.add(ep.guid);
+      added.push(ep);
+    }
+
+    if (added.length === 0) {
+      return { entries: existing, added: [] };
+    }
+
+    const next = [...existing, ...added];
+    if (next.length > maxStored) {
+      next.splice(0, next.length - maxStored);
+    }
+
+    const commit = await kv.atomic()
+      .check({ key: ["entries"], versionstamp: current.versionstamp })
+      .set(["entries"], next)
+      .commit();
+
+    if (commit.ok) {
+      return { entries: next, added };
+    }
+    console.log(
+      `KV atomic merge conflict (attempt ${attempt + 1}/${maxAttempts}) — retrying`,
+    );
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,36 +242,23 @@ async function fetchFeed(): Promise<void> {
       return;
     }
 
-    const entries = await getEntries();
-    const seenGuids = new Set(entries.map((e) => e.guid));
-
-    const newEpisodes: Entry[] = [];
-    for (const ep of episodes) {
-      if (seenGuids.has(ep.guid)) continue;
-      seenGuids.add(ep.guid); // also dedupes within this batch
-      newEpisodes.push(ep);
+    const result = await mergeEntriesAtomic(episodes);
+    if (!result) {
+      console.error("Failed to merge entries after retries — giving up");
+      return;
     }
 
-    if (newEpisodes.length === 0) {
+    if (result.added.length === 0) {
       console.log(`No new episodes (checked ${episodes.length} from source)`);
       return;
     }
 
-    // Add all new episodes
-    entries.push(...newEpisodes);
-    // Keep more than MAX_EPISODES in storage so we have history,
-    // but the feed itself only shows the latest MAX_EPISODES.
-    const maxStored = 48;
-    if (entries.length > maxStored) {
-      entries.splice(0, entries.length - maxStored);
-    }
-
-    await saveEntries(entries);
-
-    for (const ep of newEpisodes) {
+    for (const ep of result.added) {
       console.log(`New: ${ep.guid} (${ep.pubDate})`);
     }
-    console.log(`Feed updated — ${newEpisodes.length} new episode(s) added`);
+    console.log(
+      `Feed updated — ${result.added.length} new episode(s) added, ${result.entries.length} total stored`,
+    );
   } catch (err) {
     console.error(`Fetch error: ${err}`);
   }
