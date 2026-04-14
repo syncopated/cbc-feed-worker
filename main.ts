@@ -34,26 +34,70 @@ interface Entry {
 
 const kv = await Deno.openKv();
 
+// Diagnostic: log how many entries already exist in KV at isolate startup.
+// If KV is persisting correctly across isolate lifetimes, this count should
+// be stable or growing. If it's always 0, KV is ephemeral (not persisted
+// across the project's isolates) and we need to fix that before any code
+// change will help.
+{
+  const bootEntries = await kv.get<Entry[]>(["entries"]);
+  console.log(
+    `[boot] KV entries at startup: ${bootEntries.value?.length ?? 0} (versionstamp=${bootEntries.versionstamp ?? "null"})`,
+  );
+}
+
 async function getEntries(): Promise<Entry[]> {
   const result = await kv.get<Entry[]>(["entries"]);
   return result.value ?? [];
 }
 
-async function saveEntries(entries: Entry[]): Promise<void> {
-  await kv.set(["entries"], entries);
-}
+// Atomically merge new episodes into the stored entries list.
+// Uses a versionstamp check to detect concurrent writes from other
+// isolates and retries on conflict. Returns the final entries list
+// on success, or null if all retries were exhausted.
+async function mergeEntriesAtomic(
+  candidates: Entry[],
+  maxStored = 48,
+  maxAttempts = 5,
+): Promise<{ entries: Entry[]; added: Entry[] } | null> {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const current = await kv.get<Entry[]>(["entries"]);
+    const existing = current.value ?? [];
+    const seen = new Set(existing.map((e) => e.guid));
 
-async function saveFeedXml(xml: string): Promise<void> {
-  await kv.set(["feed-xml"], xml);
-}
+    const added: Entry[] = [];
+    for (const ep of candidates) {
+      if (seen.has(ep.guid)) continue;
+      seen.add(ep.guid);
+      added.push(ep);
+    }
 
-async function getFeedXml(): Promise<string | null> {
-  const result = await kv.get<string>(["feed-xml"]);
-  return result.value;
+    if (added.length === 0) {
+      return { entries: existing, added: [] };
+    }
+
+    const next = [...existing, ...added];
+    if (next.length > maxStored) {
+      next.splice(0, next.length - maxStored);
+    }
+
+    const commit = await kv.atomic()
+      .check({ key: ["entries"], versionstamp: current.versionstamp })
+      .set(["entries"], next)
+      .commit();
+
+    if (commit.ok) {
+      return { entries: next, added };
+    }
+    console.log(
+      `KV atomic merge conflict (attempt ${attempt + 1}/${maxAttempts}) — retrying`,
+    );
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
-// XML parsing — extract the current episode from CBC's feed
+// XML parsing — extract episodes from CBC's feed
 // ---------------------------------------------------------------------------
 
 const parser = new XMLParser({
@@ -61,40 +105,46 @@ const parser = new XMLParser({
   attributeNamePrefix: "@_",
 });
 
-function parseEpisode(xml: string): Entry | null {
+function parseEpisodes(xml: string): Entry[] {
   const feed = parser.parse(xml);
   const channel = feed?.rss?.channel;
-  if (!channel) return null;
+  if (!channel) return [];
 
   const items = Array.isArray(channel.item) ? channel.item : [channel.item];
-  const item = items[0];
-  if (!item) return null;
+  const now = new Date().toISOString();
+  const entries: Entry[] = [];
 
-  const guid =
-    typeof item.guid === "object" ? item.guid["#text"] : String(item.guid);
-  if (!guid) return null;
+  for (const item of items) {
+    if (!item) continue;
 
-  const pubDate = item.pubDate ?? "";
-  let pubDateISO: string;
-  try {
-    pubDateISO = new Date(pubDate).toISOString();
-  } catch {
-    pubDateISO = new Date().toISOString();
+    const guid =
+      typeof item.guid === "object" ? item.guid["#text"] : String(item.guid);
+    if (!guid) continue;
+
+    const pubDate = item.pubDate ?? "";
+    let pubDateISO: string;
+    try {
+      pubDateISO = new Date(pubDate).toISOString();
+    } catch {
+      pubDateISO = now;
+    }
+
+    entries.push({
+      guid,
+      title: item.title ?? "",
+      description: item.description ?? "",
+      summary: item["itunes:summary"] ?? "",
+      pubDate,
+      pubDateISO,
+      duration: item["itunes:duration"] ?? "",
+      audioUrl: item.enclosure?.["@_url"] ?? "",
+      audioLength: parseInt(item.enclosure?.["@_length"] ?? "0", 10),
+      audioType: item.enclosure?.["@_type"] ?? "",
+      fetchedAt: now,
+    });
   }
 
-  return {
-    guid,
-    title: item.title ?? "",
-    description: item.description ?? "",
-    summary: item["itunes:summary"] ?? "",
-    pubDate,
-    pubDateISO,
-    duration: item["itunes:duration"] ?? "",
-    audioUrl: item.enclosure?.["@_url"] ?? "",
-    audioLength: parseInt(item.enclosure?.["@_length"] ?? "0", 10),
-    audioType: item.enclosure?.["@_type"] ?? "",
-    fetchedAt: new Date().toISOString(),
-  };
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,35 +248,29 @@ async function fetchFeed(): Promise<void> {
       return;
     }
     const xml = await response.text();
-    const episode = parseEpisode(xml);
-    if (!episode) {
-      console.log("No episode found in feed");
+    const episodes = parseEpisodes(xml);
+    if (episodes.length === 0) {
+      console.log("No episodes found in feed");
       return;
     }
 
-    const entries = await getEntries();
-    const existing = entries.find((e) => e.guid === episode.guid);
-
-    if (existing) {
-      console.log(`Seen: ${episode.guid} (${episode.pubDate})`);
+    const result = await mergeEntriesAtomic(episodes);
+    if (!result) {
+      console.error("Failed to merge entries after retries — giving up");
       return;
     }
 
-    // New episode — add it and cap the list
-    entries.push(episode);
-    // Keep more than MAX_EPISODES in storage so we have history,
-    // but the feed itself only shows the latest MAX_EPISODES.
-    const maxStored = 48;
-    if (entries.length > maxStored) {
-      entries.splice(0, entries.length - maxStored);
+    if (result.added.length === 0) {
+      console.log(`No new episodes (checked ${episodes.length} from source)`);
+      return;
     }
 
-    await saveEntries(entries);
-
-    const feedXml = generateFeedXml(entries);
-    await saveFeedXml(feedXml);
-
-    console.log(`New: ${episode.guid} (${episode.pubDate}) — feed updated`);
+    for (const ep of result.added) {
+      console.log(`New: ${ep.guid} (${ep.pubDate})`);
+    }
+    console.log(
+      `Feed updated — ${result.added.length} new episode(s) added, ${result.entries.length} total stored`,
+    );
   } catch (err) {
     console.error(`Fetch error: ${err}`);
   }
@@ -245,10 +289,11 @@ Deno.serve({ port: 8000 }, async (req: Request) => {
   const url = new URL(req.url);
 
   if (url.pathname === "/feed.xml" || url.pathname === "/feed") {
-    const xml = await getFeedXml();
-    if (!xml) {
+    const entries = await getEntries();
+    if (entries.length === 0) {
       return new Response("Feed not yet available", { status: 503 });
     }
+    const xml = generateFeedXml(entries);
     return new Response(xml, {
       headers: {
         "content-type": "application/rss+xml; charset=utf-8",
