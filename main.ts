@@ -34,6 +34,18 @@ interface Entry {
 
 const kv = await Deno.openKv();
 
+// Diagnostic: log how many entries already exist in KV at isolate startup.
+// If KV is persisting correctly across isolate lifetimes, this count should
+// be stable or growing. If it's always 0, KV is ephemeral (not persisted
+// across the project's isolates) and we need to fix that before any code
+// change will help.
+{
+  const bootEntries = await kv.get<Entry[]>(["entries"]);
+  console.log(
+    `[boot] KV entries at startup: ${bootEntries.value?.length ?? 0} (versionstamp=${bootEntries.versionstamp ?? "null"})`,
+  );
+}
+
 async function getEntries(): Promise<Entry[]> {
   const result = await kv.get<Entry[]>(["entries"]);
   return result.value ?? [];
