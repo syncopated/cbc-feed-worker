@@ -211,9 +211,14 @@ async function fetchFeed(): Promise<void> {
     }
 
     const entries = await getEntries();
-    const knownGuids = new Set(entries.map((e) => e.guid));
+    const seenGuids = new Set(entries.map((e) => e.guid));
 
-    const newEpisodes = episodes.filter((ep) => !knownGuids.has(ep.guid));
+    const newEpisodes: Entry[] = [];
+    for (const ep of episodes) {
+      if (seenGuids.has(ep.guid)) continue;
+      seenGuids.add(ep.guid); // also dedupes within this batch
+      newEpisodes.push(ep);
+    }
 
     if (newEpisodes.length === 0) {
       console.log(`No new episodes (checked ${episodes.length} from source)`);
@@ -244,6 +249,15 @@ async function fetchFeed(): Promise<void> {
 }
 
 Deno.cron("fetch-cbc-feed", "*/5 * * * *", fetchFeed);
+
+// Regenerate the feed XML on startup from whatever history is in KV,
+// so the served feed reflects all accumulated episodes even if no new
+// episode is fetched this cycle.
+const existingEntries = await getEntries();
+if (existingEntries.length > 0) {
+  await saveFeedXml(generateFeedXml(existingEntries));
+  console.log(`Startup: regenerated feed XML from ${existingEntries.length} stored entries`);
+}
 
 // Run once on startup so the feed is populated immediately
 await fetchFeed();
