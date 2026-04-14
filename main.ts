@@ -53,7 +53,7 @@ async function getFeedXml(): Promise<string | null> {
 }
 
 // ---------------------------------------------------------------------------
-// XML parsing — extract the current episode from CBC's feed
+// XML parsing — extract episodes from CBC's feed
 // ---------------------------------------------------------------------------
 
 const parser = new XMLParser({
@@ -61,40 +61,46 @@ const parser = new XMLParser({
   attributeNamePrefix: "@_",
 });
 
-function parseEpisode(xml: string): Entry | null {
+function parseEpisodes(xml: string): Entry[] {
   const feed = parser.parse(xml);
   const channel = feed?.rss?.channel;
-  if (!channel) return null;
+  if (!channel) return [];
 
   const items = Array.isArray(channel.item) ? channel.item : [channel.item];
-  const item = items[0];
-  if (!item) return null;
+  const now = new Date().toISOString();
+  const entries: Entry[] = [];
 
-  const guid =
-    typeof item.guid === "object" ? item.guid["#text"] : String(item.guid);
-  if (!guid) return null;
+  for (const item of items) {
+    if (!item) continue;
 
-  const pubDate = item.pubDate ?? "";
-  let pubDateISO: string;
-  try {
-    pubDateISO = new Date(pubDate).toISOString();
-  } catch {
-    pubDateISO = new Date().toISOString();
+    const guid =
+      typeof item.guid === "object" ? item.guid["#text"] : String(item.guid);
+    if (!guid) continue;
+
+    const pubDate = item.pubDate ?? "";
+    let pubDateISO: string;
+    try {
+      pubDateISO = new Date(pubDate).toISOString();
+    } catch {
+      pubDateISO = now;
+    }
+
+    entries.push({
+      guid,
+      title: item.title ?? "",
+      description: item.description ?? "",
+      summary: item["itunes:summary"] ?? "",
+      pubDate,
+      pubDateISO,
+      duration: item["itunes:duration"] ?? "",
+      audioUrl: item.enclosure?.["@_url"] ?? "",
+      audioLength: parseInt(item.enclosure?.["@_length"] ?? "0", 10),
+      audioType: item.enclosure?.["@_type"] ?? "",
+      fetchedAt: now,
+    });
   }
 
-  return {
-    guid,
-    title: item.title ?? "",
-    description: item.description ?? "",
-    summary: item["itunes:summary"] ?? "",
-    pubDate,
-    pubDateISO,
-    duration: item["itunes:duration"] ?? "",
-    audioUrl: item.enclosure?.["@_url"] ?? "",
-    audioLength: parseInt(item.enclosure?.["@_length"] ?? "0", 10),
-    audioType: item.enclosure?.["@_type"] ?? "",
-    fetchedAt: new Date().toISOString(),
-  };
+  return entries;
 }
 
 // ---------------------------------------------------------------------------
@@ -198,22 +204,24 @@ async function fetchFeed(): Promise<void> {
       return;
     }
     const xml = await response.text();
-    const episode = parseEpisode(xml);
-    if (!episode) {
-      console.log("No episode found in feed");
+    const episodes = parseEpisodes(xml);
+    if (episodes.length === 0) {
+      console.log("No episodes found in feed");
       return;
     }
 
     const entries = await getEntries();
-    const existing = entries.find((e) => e.guid === episode.guid);
+    const knownGuids = new Set(entries.map((e) => e.guid));
 
-    if (existing) {
-      console.log(`Seen: ${episode.guid} (${episode.pubDate})`);
+    const newEpisodes = episodes.filter((ep) => !knownGuids.has(ep.guid));
+
+    if (newEpisodes.length === 0) {
+      console.log(`No new episodes (checked ${episodes.length} from source)`);
       return;
     }
 
-    // New episode — add it and cap the list
-    entries.push(episode);
+    // Add all new episodes
+    entries.push(...newEpisodes);
     // Keep more than MAX_EPISODES in storage so we have history,
     // but the feed itself only shows the latest MAX_EPISODES.
     const maxStored = 48;
@@ -226,7 +234,10 @@ async function fetchFeed(): Promise<void> {
     const feedXml = generateFeedXml(entries);
     await saveFeedXml(feedXml);
 
-    console.log(`New: ${episode.guid} (${episode.pubDate}) — feed updated`);
+    for (const ep of newEpisodes) {
+      console.log(`New: ${ep.guid} (${ep.pubDate})`);
+    }
+    console.log(`Feed updated — ${newEpisodes.length} new episode(s) added`);
   } catch (err) {
     console.error(`Fetch error: ${err}`);
   }
