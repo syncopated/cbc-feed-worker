@@ -210,6 +210,7 @@ function generateFeedXml(entries: Entry[]): string {
             <itunes:summary>Catch up on the day's most important news from Canada and around the world in 5 minutes. Updated every hour, 24/7.</itunes:summary>
             <pubDate>${esc(effectivePubDate(entry).toUTCString())}</pubDate>
             <itunes:duration>${esc(entry.duration)}</itunes:duration>
+            <itunes:episodeType>full</itunes:episodeType>
             <itunes:explicit>No</itunes:explicit>
             <enclosure url="${esc(entry.audioUrl)}" length="${entry.audioLength}" type="${esc(entry.audioType)}" />
         </item>`
@@ -224,6 +225,8 @@ function generateFeedXml(entries: Entry[]): string {
         <title>The World This Hour</title>
         <link>https://www.cbc.ca/radio/podcasts</link>
         <description>Catch up on the day's most important news from Canada and around the world in 5 minutes. Updated every hour, 24/7. Last ${MAX_EPISODES} episodes.</description>
+        <lastBuildDate>${new Date().toUTCString()}</lastBuildDate>
+        <itunes:type>episodic</itunes:type>
         <itunes:summary>Catch up on the day's most important news from Canada and around the world in 5 minutes. Updated every hour, 24/7.</itunes:summary>
         <itunes:owner>
             <itunes:name>CBC</itunes:name>
