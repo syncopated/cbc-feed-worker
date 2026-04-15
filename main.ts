@@ -250,6 +250,20 @@ ${items}
 }
 
 // ---------------------------------------------------------------------------
+// Overcast ping — trigger immediate crawl when new episodes land
+// ---------------------------------------------------------------------------
+
+async function pingOvercast(): Promise<void> {
+  const url = `https://overcast.fm/ping?urlprefix=${encodeURIComponent(SELF_URL)}`;
+  try {
+    const res = await fetch(url, { method: "POST" });
+    console.log(`[overcast] ping ${res.status} ${res.statusText}`);
+  } catch (err) {
+    console.error(`[overcast] ping failed: ${err}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Cron — fetch CBC feed every 5 minutes
 // ---------------------------------------------------------------------------
 
@@ -288,6 +302,7 @@ async function fetchFeed(): Promise<void> {
     console.log(
       `Feed updated — ${result.added.length} new episode(s) added, ${result.entries.length} total stored`,
     );
+    await pingOvercast();
   } catch (err) {
     console.error(`Fetch error: ${err}`);
   }
